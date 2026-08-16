@@ -37,13 +37,84 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_gro
 
 _original_similarity = None
 
+_MINIMAX_H3_DIT_CLASS_NAME = "MiniMaxH3DiTModel"
+_MINIMAX_H3_PRESERVE_INPUT_ATTR = "_sglang_cache_dit_preserve_input"
+_MINIMAX_H3_PRESERVED_BLOCKS_ATTR = "_sglang_cache_dit_preserved_blocks"
+
+
+def _clear_minimax_h3_cache_input_preservation(
+    transformer: torch.nn.Module,
+) -> None:
+    """Remove Cache-DiT input-preservation markers from MiniMax-H3 blocks."""
+
+    if transformer.__class__.__name__ != _MINIMAX_H3_DIT_CLASS_NAME:
+        return
+
+    blocks = transformer.blocks
+    preserved_indices = getattr(
+        transformer,
+        _MINIMAX_H3_PRESERVED_BLOCKS_ATTR,
+        (),
+    )
+    for index in preserved_indices:
+        if 0 <= index < len(blocks):
+            block = blocks[index]
+            if hasattr(block, _MINIMAX_H3_PRESERVE_INPUT_ATTR):
+                delattr(block, _MINIMAX_H3_PRESERVE_INPUT_ATTR)
+
+    if hasattr(transformer, _MINIMAX_H3_PRESERVED_BLOCKS_ATTR):
+        delattr(transformer, _MINIMAX_H3_PRESERVED_BLOCKS_ATTR)
+
+
+def _set_minimax_h3_cache_input_preservation(
+    transformer: torch.nn.Module,
+    config,
+) -> None:
+    """Protect the Fn/Mn region inputs retained by Cache-DiT for H3."""
+
+    if transformer.__class__.__name__ != _MINIMAX_H3_DIT_CLASS_NAME:
+        return
+
+    _clear_minimax_h3_cache_input_preservation(transformer)
+
+    blocks = transformer.blocks
+    num_blocks = len(blocks)
+    boundary_indices = set()
+
+    # Cache-DiT retains one input before the complete Fn region.
+    if config.Fn_compute_blocks > 0 and num_blocks > 0:
+        boundary_indices.add(0)
+
+    # Cache-DiT retains another input before the complete Mn region.
+    mn_start = config.Fn_compute_blocks
+    mn_end = num_blocks - config.Bn_compute_blocks
+    if 0 <= mn_start < mn_end:
+        boundary_indices.add(mn_start)
+
+    for index in boundary_indices:
+        setattr(blocks[index], _MINIMAX_H3_PRESERVE_INPUT_ATTR, True)
+
+    preserved_indices = tuple(sorted(boundary_indices))
+    setattr(
+        transformer,
+        _MINIMAX_H3_PRESERVED_BLOCKS_ATTR,
+        preserved_indices,
+    )
+    logger.info(
+        "MiniMax-H3 Cache-DiT input preservation enabled on block boundaries %s",
+        preserved_indices,
+    )
+
 
 def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Module:
     """Remove Cache-DiT hooks so subsequent requests use the native forward."""
 
     logger.info("Disabling cache-dit on %s", type(transformer).__name__)
     target = getattr(transformer, "_sglang_cache_dit_adapter", transformer)
-    cache_dit.disable_cache(target)
+    try:
+        cache_dit.disable_cache(target)
+    finally:
+        _clear_minimax_h3_cache_input_preservation(transformer)
     if target is not transformer:
         del transformer._sglang_cache_dit_adapter
     for name in ("_is_parallelized", "_parallelism_config"):
@@ -421,12 +492,17 @@ def enable_cache_on_transformer(
             model_name,
             custom_adapter.forward_pattern,
         )
-    cache_dit.enable_cache(
-        target,
-        cache_config=cache_config,
-        calibrator_config=calibrator_config,
-        parallelism_config=None,
-    )
+    _set_minimax_h3_cache_input_preservation(transformer, config)
+    try:
+        cache_dit.enable_cache(
+            target,
+            cache_config=cache_config,
+            calibrator_config=calibrator_config,
+            parallelism_config=None,
+        )
+    except Exception:
+        _clear_minimax_h3_cache_input_preservation(transformer)
+        raise
     if custom_adapter is not None:
         transformer._sglang_cache_dit_adapter = custom_adapter
 

@@ -5,12 +5,15 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Mapping
 from contextlib import contextmanager
 from functools import partial
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
@@ -46,6 +49,17 @@ _REF2VA_VIDEO_CHAINS = {
     "video.reference_preserve",
     "video_audio.reference_preserve",
 }
+
+_MINIMAX_H3_CACHE_DIT_STATS_ENV = "SGLANG_MINIMAX_H3_CACHE_DIT_STATS"
+
+
+def _minimax_h3_cache_dit_stats_enabled() -> bool:
+    return os.getenv(_MINIMAX_H3_CACHE_DIT_STATS_ENV, "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
@@ -399,6 +413,36 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             or super()._cache_dit_requested()
         )
 
+    def _maybe_log_cache_dit_stats(self) -> None:
+        """Log detailed Cache-DiT statistics for H3 on global rank zero."""
+
+        if not _minimax_h3_cache_dit_stats_enabled():
+            return
+        if not getattr(self, "_cache_dit_enabled", False):
+            return
+
+        is_rank_zero = not (
+            dist.is_available() and dist.is_initialized() and dist.get_rank() != 0
+        )
+
+        try:
+            import cache_dit
+
+            summary = cache_dit.summary(
+                self.transformer,
+                details=True,
+                logging=False,
+            )
+            if is_rank_zero:
+                logger.info(
+                    "H3_CACHE_DIT_RUNTIME_SUMMARY=%s",
+                    json.dumps(summary, ensure_ascii=False, default=str),
+                )
+        except Exception:
+            # Statistics are diagnostic-only and must not fail generation.
+            if is_rank_zero:
+                logger.exception("Failed to collect MiniMax-H3 Cache-DiT statistics")
+
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
@@ -610,6 +654,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             video_rows=video_rows,
             audio_rows=audio_rows,
         )
+        self._maybe_log_cache_dit_stats()
 
     @contextmanager
     def _profile_denoising_step(self, step_index: int, *, batch: Req):

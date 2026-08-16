@@ -923,6 +923,12 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
         """
+        # Cache-DiT retains the input at the Fn/Mn region boundaries. The
+        # fused gated residual below mutates its input, so detach the marked
+        # boundary from the retained tensor before entering the block.
+        if getattr(self, "_sglang_cache_dit_preserve_input", False):
+            x = x.clone()
+
         if adaln_params is None:
             adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
